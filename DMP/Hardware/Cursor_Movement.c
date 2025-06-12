@@ -1,0 +1,172 @@
+#include "stm32f10x.h"                  // Device header
+#include "MPU6050.h" 
+#include "Delay.h" 
+#include <stdint.h>
+#include <stdlib.h>  // 提供abs()函数声明
+#include <math.h>    // 提供fabsf()函数声明
+
+// MPU6050校准参数
+float offset_x = 0;  // X轴零偏
+float offset_y = 0;  // Y轴零偏
+float offset_z = 0;  // Y轴零偏
+
+// 滤波器参数
+#define ALPHA_HPF 0.95f   // 高通滤波系数（0.9~0.99）
+#define SAMPLE_RATE 200    // 采样率200Hz
+#define DT          0.005f// 采样时间间隔 (1.0f/SAMPLE_RATE)
+
+// 动态清零阈值
+#define ACCEL_THRESHOLD 0.025f  // 加速度阈值（g）
+#define VELOCITY_THRESHOLD 0.08f // 速度阈值（m/s）
+
+// 灵敏度参数
+#define SENSITIVITY 800.0f  // 光标移动灵敏度
+
+//按键部分
+#define Key_THRESHOLD 1.0f  // 加速度阈值（g）
+#define VELOCITY_THRESHOLD 0.08f // 速度阈值（m/s）
+// 状态变量
+float prev_ax = 0.0f, prev_ay = 0.0f;     // 前一次加速度值（用于高通滤波）
+float filtered_ax = 0.0f, filtered_ay = 0.0f; // 滤波后加速度
+float velocity_x = 0.0f, velocity_y = 0.0f;   // 当前速度
+int8_t mouse_x = 0, mouse_y = 0;          // 最终光标移动量
+
+
+extern uint8_t Key_Num;
+uint8_t Mode_Flag=0;
+uint8_t key_delay_falg=0;
+//定时初始化
+void TIM1_Init(void)
+{
+	/*开启时钟*/
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_TIM1, ENABLE);			//开启TIM1的时钟
+	
+	/*时基单元初始化*/
+	TIM_TimeBaseInitTypeDef TIM_TimeBaseInitStructure;				//定义结构体变量
+	TIM_TimeBaseInitStructure.TIM_ClockDivision = TIM_CKD_DIV1;		//时钟分频，选择不分频，此参数用于配置滤波器时钟，不影响时基单元功能
+	TIM_TimeBaseInitStructure.TIM_CounterMode = TIM_CounterMode_Up;	//计数器模式，选择向上计数
+	TIM_TimeBaseInitStructure.TIM_Period = 5000 - 1;				//计数周期，即ARR的值 实现1s定时中断
+	TIM_TimeBaseInitStructure.TIM_Prescaler = 7200 - 1;				//预分频器，即PSC的值
+	TIM_TimeBaseInitStructure.TIM_RepetitionCounter = 0;			//重复计数器，高级定时器才会用到
+	TIM_TimeBaseInit(TIM1, &TIM_TimeBaseInitStructure);				//将结构体变量交给TIM_TimeBaseInit，配置TIM1的时基单元	
+	
+	/*中断输出配置*/
+//	TIM_ClearFlag(TIM1, TIM_FLAG_Update);						//清除定时器更新标志位
+																//TIM_TimeBaseInit函数末尾，手动产生了更新事件
+																//若不清除此标志位，则开启中断后，会立刻进入一次中断
+																//如果不介意此问题，则不清除此标志位也可
+	TIM_ITConfig(TIM1, TIM_IT_Update, ENABLE);		
+	/*NVIC中断分组*/
+	NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);				//配置NVIC为分组2
+																//即抢占优先级范围：0~3，响应优先级范围：0~3
+																//此分组配置在整个工程中仅需调用一次
+																//若有多个中断，可以把此代码放在main函数内，while循环之前
+																//若调用多次配置分组的代码，则后执行的配置会覆盖先执行的配置
+	
+	/*NVIC配置*/
+	NVIC_InitTypeDef NVIC_InitStructure;						//定义结构体变量
+	NVIC_InitStructure.NVIC_IRQChannel = TIM1_UP_IRQn;				//选择配置NVIC的TIM1线
+	NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;				//指定NVIC线路使能
+	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 2;	//指定NVIC线路的抢占优先级为2
+	NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;			//指定NVIC线路的响应优先级为1
+	NVIC_Init(&NVIC_InitStructure);								//将结构体变量交给NVIC_Init，配置NVIC外设
+	
+	/*TIM使能*/
+	TIM_Cmd(TIM1, ENABLE);			//使能TIM1，定时器开始运行
+	TIM_ITConfig(TIM1, TIM_IT_Update, DISABLE);					//关闭TIM1的更新中断，当外部中断触发时才进行
+}
+
+void Cursor_Init(void)
+{
+	float sum_ax = 0, sum_ay = 0, sum_az = 0;
+	for (int i = 0; i < 100; i++) {
+		int16_t ax, ay, az;
+    MPU_Get_Accelerometer(&ax, &ay, &az);
+		sum_ax += ax;
+		sum_ay += ay;
+		sum_az += az;
+		Delay_ms(5);
+	}
+	offset_x = sum_ax / 100;  // 实际是X轴零偏+0g（理想情况）
+	offset_y = sum_ay / 100;  // Y轴同理
+	offset_z = sum_az / 100 - 16384; // Z轴零偏-1g（量程±2g，1g对应65535/4 LSB）
+}
+
+
+
+void ProcessSensorData(int16_t raw_ax, int16_t raw_ay,float yaw) 
+{
+	  if(fabs(yaw)<=20)
+		{
+			// 1. 去零偏并转换单位
+			float ax = (raw_ax - offset_x) / 16384.0f;
+			float ay = (raw_ay - offset_y) / 16384.0f;
+			// 2. 滑动窗口滤波（可选）
+			static float ax_buf[5] = {0}, ay_buf[5] = {0};
+			static uint8_t idx = 0;
+			ax_buf[idx] = ax;
+			ay_buf[idx] = ay;
+			idx = (idx + 1) % 5;
+			ax = (ax_buf[0] + ax_buf[1] + ax_buf[2] + ax_buf[3] + ax_buf[4]) / 5.0f;
+			ay = (ay_buf[0] + ay_buf[1] + ay_buf[2] + ay_buf[3] + ay_buf[4]) / 5.0f;
+
+			// 3. 高通滤波
+			static float prev_ax = 0, prev_ay = 0;
+			filtered_ax = ALPHA_HPF * (filtered_ax + ax - prev_ax);
+			filtered_ay = ALPHA_HPF * (filtered_ay + ay - prev_ay);
+			//判断挥动
+			prev_ax = ax;
+			prev_ay = ay;
+			
+			// 4. 速度积分
+			velocity_x += filtered_ax * 9.8f * DT;
+			velocity_y += filtered_ay * 9.8f * DT;
+			
+			// 5. 动态清零
+			if (fabsf(filtered_ax) < ACCEL_THRESHOLD  
+				&&fabsf(filtered_ay) < ACCEL_THRESHOLD 
+				&&fabsf(velocity_x) < VELOCITY_THRESHOLD
+				&&fabsf(velocity_y) < VELOCITY_THRESHOLD
+			) 
+			{
+					velocity_x = velocity_y = 0;
+			}
+			
+				mouse_x = (int8_t)(velocity_x * SENSITIVITY);
+				mouse_y = (int8_t)(velocity_y * SENSITIVITY);
+
+				if (abs(mouse_y) < 5) mouse_y = 0;
+				if (abs(mouse_x) < 5) mouse_x = 0;
+		}
+		else if((fabs(yaw)<70)&&(fabs(yaw)>20)&&(key_delay_falg==0)){
+			if(yaw>40)
+			{
+				Key_Num|=0x02;
+			}
+			else if(yaw<(-40)){
+				Key_Num|=0x01;
+			}
+			key_delay_falg=1;
+		  TIM_SetCounter(TIM1, 0);      // 重置计数器
+      TIM_Cmd(TIM1, ENABLE);        // 启动定时器
+		}
+    
+		
+}
+
+
+// 在中断中清零
+void TIM1_IRQHandler(void) {
+    if (TIM_GetITStatus(TIM1, TIM_IT_Update)) {
+			  //100ms无动作则清零
+        if(key_delay_falg==1)
+				{
+					key_delay_falg=0;
+					TIM_Cmd(TIM1, DISABLE);  // 停止定时器
+					TIM_ClearITPendingBit(TIM1, TIM_IT_Update);
+				}
+				
+    }
+}
+
+
